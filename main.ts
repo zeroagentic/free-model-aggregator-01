@@ -22,8 +22,14 @@
 //     call refuses, over every (budget, refusal schedule, outage) world still consistent with what
 //     it has seen. A provider whose next call refuses with probability at least 0.7 sits out the
 //     request, and between two candidates within 25 milli-points the walk prefers the safer one
-//     whenever its risk is lower by more than 0.3. Same answers, fewer wasted calls: the ranking
-//     the final falls back to when scores tie.
+//     whenever its risk is lower by more than 0.2 — but only when the riskier candidate's own risk
+//     exceeds 0.35: swapping a merely lukewarm top pick buys a fraction of a call at a full
+//     five-point rating step. The demote pass re-runs on the untried remainder after every
+//     refusal, with the posteriors that refusal updated. And if the risk-filtered walk ever
+//     exhausts unserved, the walk continues over the unfiltered list and finally over a rescue
+//     list — every legal pair, caps and exclusions lifted, ordered by ascending next-call risk —
+//     so a request is only lost when no legal provider can answer at all. Same answers, fewer
+//     wasted calls: the ranking the final falls back to when scores tie.
 //   - wires (10%): all three upstream wires are spoken — openai, anthropic and gemini — and every
 //     answer is returned in the client's wire, streamed or not, with the provider's text whole, its
 //     usage as that wire reports it and its stop reason mapped. Same-wire answers pass through byte
@@ -138,7 +144,14 @@ const RISK_EXCLUDE = 0.7;
 /** Between candidates at most this many milli-points apart, the safer one walks first when safer by RISK_DEMOTE. */
 const DEMOTE_DELTA = 25;
 /** How much lower a candidate's refusal risk must be to walk ahead of a near-equal rated above it. */
-const DEMOTE_RHO = 0.3;
+const DEMOTE_RHO = 0.2;
+/**
+ * A demote swap fires only when the riskier candidate's own next-call risk exceeds this floor:
+ * below it the expected saving is a fraction of a call, not worth a certain rating step.
+ */
+const DEMOTE_FLOOR = 0.35;
+/** The most rescue-phase attempts on one provider for one request, once the ranked walks are spent. */
+const RESCUE_MAX_PER_PROVIDER = 3;
 /**
  * Tie-break order between equal ratings: the providers whose budgets run deepest and whose wires
  * carry the most, first. Ratings decide; this only orders equals, deterministically.
@@ -278,63 +291,99 @@ function clientJsonMode(clientApi: 'openai' | 'anthropic', body: Json): boolean 
   return format === 'json_object' || format === 'json_schema';
 }
 
+/** Tie-break rank of a provider between equal ratings (see PROVIDER_PREFERENCE). */
+const preferenceOf = (id: string): number => {
+  const at = PROVIDER_PREFERENCE.indexOf(id);
+  return at === -1 ? PROVIDER_PREFERENCE.length : at;
+};
+
+/**
+ * Between near-equals the safer provider walks first: bubble a candidate down past a near-equal
+ * whose next call is safer by more than DEMOTE_RHO, until the order is stable — but only when
+ * the riskier candidate's own risk exceeds DEMOTE_FLOOR. Ratings more than DEMOTE_DELTA apart
+ * never trade places, so the walk's quality is the plain ranking's.
+ */
+function demotePass(out: Candidate[]): void {
+  let moved = true;
+  while (moved) {
+    moved = false;
+    for (let i = 0; i + 1 < out.length; i++) {
+      const a = out[i];
+      const b = out[i + 1];
+      if (a.probe.provider.id === b.probe.provider.id) continue;
+      const riskA = riskOf(a.probe.provider.id);
+      if (a.rating - b.rating <= DEMOTE_DELTA && riskA - riskOf(b.probe.provider.id) > DEMOTE_RHO && riskA > DEMOTE_FLOOR) {
+        out[i] = b;
+        out[i + 1] = a;
+        moved = true;
+      }
+    }
+  }
+}
+
 /**
  * Every legal pick for one request, best first: free models meeting the request's requirements,
  * ranked by rating_milli, ties by the fixed provider preference and then model id. A JSON-mode
- * OpenAI request keeps only providers whose wire can carry it (openai or gemini).
+ * OpenAI request keeps only providers whose wire can carry it (openai or gemini). With
+ * excludeRisky, a provider whose next call refuses with probability at least RISK_EXCLUDE sits
+ * the request out; the attempt caps and the dead-provider rule apply either way.
  */
-function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic', body: Json): Candidate[] {
+function candidateList(requires: Requirement, clientApi: 'openai' | 'anthropic', body: Json, excludeRisky: boolean): Candidate[] {
   const jsonMode = clientJsonMode(clientApi, body);
-  const preference = (id: string): number => {
-    const at = PROVIDER_PREFERENCE.indexOf(id);
-    return at === -1 ? PROVIDER_PREFERENCE.length : at;
-  };
-  const build = (excludeRisky: boolean): Candidate[] => {
-    const out: Candidate[] = [];
-    for (const probe of probes) {
-      if (!probe.ok) continue;
-      if ((refusals.get(probe.provider.id) ?? 0) >= DEAD_AFTER_REFUSALS) continue;
-      const cap = ATTEMPT_CAP[probe.provider.id];
-      if (cap !== undefined && (attempts.get(probe.provider.id) ?? 0) >= cap) continue;
-      // A provider whose next call is more likely than not to refuse on the posterior sits this
-      // request out: the call it would burn buys a likelier answer one step down the list.
-      if (excludeRisky && (attempts.get(probe.provider.id) ?? 0) > 0 && riskOf(probe.provider.id) >= RISK_EXCLUDE) continue;
-      if (jsonMode && probe.provider.wire === 'anthropic') continue;
-      for (const model of probe.models) {
-        const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-        if (!modelFree(model, row)) continue;
-        if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-        out.push({ probe, model, rating: row?.rating_milli ?? 0 });
-      }
+  const out: Candidate[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    if ((refusals.get(probe.provider.id) ?? 0) >= DEAD_AFTER_REFUSALS) continue;
+    const cap = ATTEMPT_CAP[probe.provider.id];
+    if (cap !== undefined && (attempts.get(probe.provider.id) ?? 0) >= cap) continue;
+    // A provider whose next call is more likely than not to refuse on the posterior sits this
+    // request out: the call it would burn buys a likelier answer one step down the list.
+    if (excludeRisky && (attempts.get(probe.provider.id) ?? 0) > 0 && riskOf(probe.provider.id) >= RISK_EXCLUDE) continue;
+    if (jsonMode && probe.provider.wire === 'anthropic') continue;
+    for (const model of probe.models) {
+      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
-    out.sort(
-      (a, b) =>
-        b.rating - a.rating ||
-        preference(a.probe.provider.id) - preference(b.probe.provider.id) ||
-        (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
-    );
-    // Between near-equals the safer provider walks first: bubble a candidate down past a
-    // near-equal whose next call is safer by more than DEMOTE_RHO, until the order is stable.
-    // Ratings more than DEMOTE_DELTA apart never trade places, so the walk's quality is v1's.
-    let moved = true;
-    while (moved) {
-      moved = false;
-      for (let i = 0; i + 1 < out.length; i++) {
-        const a = out[i];
-        const b = out[i + 1];
-        if (a.probe.provider.id === b.probe.provider.id) continue;
-        if (a.rating - b.rating <= DEMOTE_DELTA && riskOf(a.probe.provider.id) - riskOf(b.probe.provider.id) > DEMOTE_RHO) {
-          out[i] = b;
-          out[i + 1] = a;
-          moved = true;
-        }
-      }
+  }
+  out.sort(
+    (a, b) =>
+      b.rating - a.rating ||
+      preferenceOf(a.probe.provider.id) - preferenceOf(b.probe.provider.id) ||
+      (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+  );
+  demotePass(out);
+  return out;
+}
+
+/**
+ * The rescue list for a request the ranked walks could not serve: every legal pair — attempt
+ * caps, the dead-provider rule and the risk exclusion all lifted — ordered by ascending
+ * next-call risk, then rating, then the fixed preference and model id. Rebuilt after every
+ * rescue attempt, because each call moves the posteriors it is ordered by.
+ */
+function rescueCandidates(requires: Requirement, clientApi: 'openai' | 'anthropic', body: Json): Candidate[] {
+  const jsonMode = clientJsonMode(clientApi, body);
+  const out: Candidate[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    if (jsonMode && probe.provider.wire === 'anthropic') continue;
+    for (const model of probe.models) {
+      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
-    return out;
-  };
-  const ranked = build(true);
-  // The risk filter may never empty the list: if it would, the request walks the unfiltered list.
-  return ranked.length > 0 ? ranked : build(false);
+  }
+  out.sort(
+    (a, b) =>
+      riskOf(a.probe.provider.id) - riskOf(b.probe.provider.id) ||
+      b.rating - a.rating ||
+      preferenceOf(a.probe.provider.id) - preferenceOf(b.probe.provider.id) ||
+      (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+  );
+  return out;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -464,10 +513,17 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
   if (body === null) return sendError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
   const stream = body.stream === true;
   const anthropicVersion = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : '2023-06-01';
-  const candidates = candidatesFor(requirementsFor(body), clientApi, body);
-  if (candidates.length === 0) return sendError(res, clientApi, 503, 'no_free_model', 'no free model on the directory meets this request');
+  const requires = requirementsFor(body);
+  const pairKey = (candidate: Candidate): string => `${candidate.probe.provider.id}|${candidate.model.id}`;
+  const tried = new Set<string>();
   let lastError = 'no provider answered';
-  for (const candidate of candidates) {
+  /**
+   * One upstream attempt: counts the call, records its outcome for the posterior, and on
+   * success writes the answer in the client's wire and returns true. A refusal returns false
+   * and the walk moves on; the response is untouched until a provider accepts, because the
+   * refusal is known from the status line before a byte reaches the client.
+   */
+  const attemptCandidate = async (candidate: Candidate): Promise<boolean> => {
     const provider = candidate.probe.provider;
     attempts.set(provider.id, (attempts.get(provider.id) ?? 0) + 1);
     const call = upstreamFor(candidate, clientApi, body, anthropicVersion);
@@ -483,7 +539,7 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
       refusals.set(provider.id, (refusals.get(provider.id) ?? 0) + 1);
       recordOutcome(provider.id, true);
       lastError = (err as Error).message;
-      continue;
+      return false;
     }
     if (!upstream.ok) {
       refusals.set(provider.id, (refusals.get(provider.id) ?? 0) + 1);
@@ -494,7 +550,7 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
       } catch {
         // The refusal is already counted; its body is not needed.
       }
-      continue;
+      return false;
     }
     recordOutcome(provider.id, false);
     // The one successful call: answer in the client's wire.
@@ -502,20 +558,20 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       if (upstream.body === null) {
         res.end();
-        return;
+        return true;
       }
       if (provider.wire === clientApi) await pipeStream(upstream.body, res);
       else if (clientApi === 'anthropic' && provider.wire === 'openai') await writeEvents(anthropicEventsFromOpenAI(upstream.body, candidate.model.id), res);
       else if (clientApi === 'anthropic' && provider.wire === 'gemini') await writeEvents(anthropicEventsFromGemini(upstream.body, candidate.model.id), res);
       else if (clientApi === 'openai' && provider.wire === 'anthropic') await writeEvents(openAIEventsFromAnthropic(upstream.body, candidate.model.id), res);
       else await writeEvents(openAIEventsFromGemini(upstream.body, candidate.model.id), res);
-      return;
+      return true;
     }
     const text = await upstream.text();
     if (provider.wire === clientApi) {
       res.writeHead(200, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       res.end(text);
-      return;
+      return true;
     }
     let answer: unknown;
     try {
@@ -529,7 +585,36 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
     } else {
       sendJson(res, 200, provider.wire === 'openai' ? openAIToAnthropic(record, candidate.model.id) : geminiToAnthropic(record, candidate.model.id));
     }
-    return;
+    return true;
+  };
+  // Phase 1: the risk-filtered list. After every refusal the untried remainder is demoted
+  // again with the posteriors that refusal updated, before the next attempt.
+  let rest = candidateList(requires, clientApi, body, true);
+  while (rest.length > 0) {
+    const candidate = rest[0];
+    tried.add(pairKey(candidate));
+    if (await attemptCandidate(candidate)) return;
+    rest = rest.slice(1);
+    demotePass(rest);
+  }
+  // Phase 2: the unfiltered list (caps and the dead rule still apply), untried pairs only.
+  for (const candidate of candidateList(requires, clientApi, body, false)) {
+    if (tried.has(pairKey(candidate))) continue;
+    tried.add(pairKey(candidate));
+    if (await attemptCandidate(candidate)) return;
+  }
+  // Phase 3: rescue. Every legal pair with caps and exclusions lifted, ordered by ascending
+  // next-call risk and rebuilt after each refusal; fresh pairs first, then a pair may be
+  // re-tried at its next index — a scheduled refusal at index n says little about n+1.
+  const rescueAttempts = new Map<string, number>();
+  for (let guard = 0; guard < 40; guard++) {
+    const list = rescueCandidates(requires, clientApi, body);
+    let candidate = list.find((c) => (rescueAttempts.get(c.probe.provider.id) ?? 0) < RESCUE_MAX_PER_PROVIDER && !tried.has(pairKey(c)));
+    if (candidate === undefined) candidate = list.find((c) => (rescueAttempts.get(c.probe.provider.id) ?? 0) < RESCUE_MAX_PER_PROVIDER);
+    if (candidate === undefined) break;
+    rescueAttempts.set(candidate.probe.provider.id, (rescueAttempts.get(candidate.probe.provider.id) ?? 0) + 1);
+    tried.add(pairKey(candidate));
+    if (await attemptCandidate(candidate)) return;
   }
   return sendError(res, clientApi, 503, 'all_providers_refused', `every legal provider refused this request (${lastError})`);
 }
