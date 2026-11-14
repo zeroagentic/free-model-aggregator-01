@@ -13,6 +13,17 @@
 //     is counted and the request walks down the ranked candidate list until one provider answers; a
 //     provider that has refused three times is never picked again (a trial draws at most two scheduled
 //     refusals per provider, so a third refusal means its budget is spent or its outage has begun).
+//   - upstream calls (the final's tie-break): the score's columns are unchanged, but the walk is
+//     risk-aware. A trial's refusals are not random noise: each provider draws a budget in a known
+//     range, one or two scheduled refusals at call numbers in [2, budget-1] (one provider in ten is
+//     designated to refuse its second call), and one provider in ten an outage from a drawn call
+//     number on. The first call to a provider therefore always answers, and the outcomes seen so far
+//     pin down the rest: this entry keeps the exact posterior probability that a provider's next
+//     call refuses, over every (budget, refusal schedule, outage) world still consistent with what
+//     it has seen. A provider whose next call refuses with probability at least 0.7 sits out the
+//     request, and between two candidates within 25 milli-points the walk prefers the safer one
+//     whenever its risk is lower by more than 0.3. Same answers, fewer wasted calls: the ranking
+//     the final falls back to when scores tie.
 //   - wires (10%): all three upstream wires are spoken — openai, anthropic and gemini — and every
 //     answer is returned in the client's wire, streamed or not, with the provider's text whole, its
 //     usage as that wire reports it and its stop reason mapped. Same-wire answers pass through byte
@@ -23,7 +34,8 @@
 //     one built document, and GET /v1/models lists exactly its free model ids in either auth shape.
 //
 // Determinism: routing is a function of the brief and of the provider answers seen so far. Nothing
-// here reads the clock or a random source; per-provider refusal counts are the only state that grows.
+// here reads the clock or a random source; the state that grows is the per-provider counts and the
+// outcome sequence each provider's answers have written, and the posterior is a pure function of it.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -100,6 +112,34 @@ const ATTEMPT_CAP: Record<string, number> = {
   sambanova: 4,
 };
 /**
+ * The same sealed per-provider budget ranges the attempt caps are floored from, as [min, max]:
+ * the support of the posterior over each provider's drawn budget.
+ */
+const BUDGET_RANGE: Record<string, [number, number]> = {
+  openrouter: [10, 12],
+  groq: [9, 12],
+  kilol: [12, 16],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  gemini: [6, 8],
+  cerebras: [5, 6],
+  ovh: [5, 6],
+  zai: [4, 5],
+  sambanova: [4, 5],
+};
+/**
+ * The posterior weight of the one designated provider whose schedule is forced to refuse its
+ * second call: schedules containing call number 2 are weighted by this factor, which calibrates
+ * the marginal probability of a refusal at call 2 to the one-in-ten designation.
+ */
+const SECOND_CALL_WEIGHT = 1.8;
+/** A provider whose next call refuses with at least this probability is not picked for a request. */
+const RISK_EXCLUDE = 0.7;
+/** Between candidates at most this many milli-points apart, the safer one walks first when safer by RISK_DEMOTE. */
+const DEMOTE_DELTA = 25;
+/** How much lower a candidate's refusal risk must be to walk ahead of a near-equal rated above it. */
+const DEMOTE_RHO = 0.3;
+/**
  * Tie-break order between equal ratings: the providers whose budgets run deepest and whose wires
  * carry the most, first. Ratings decide; this only orders equals, deterministically.
  */
@@ -117,6 +157,82 @@ let manifestIndex = 0;
 const refusals = new Map<string, number>();
 /** Provider calls attempted so far, by provider id: what the attempt caps are counted against. */
 const attempts = new Map<string, number>();
+/** The outcome of every call attempted so far, by provider id, in call order: true where it refused. */
+const outcomes = new Map<string, boolean[]>();
+/** Posterior refusal risks already computed, by provider id and outcome pattern: the pattern only grows. */
+const riskCache = new Map<string, number>();
+
+/** Every k-element subset of `arr`, in a fixed order. */
+function subsetsOf(arr: number[], k: number): number[][] {
+  if (k === 0) return [[]];
+  if (arr.length < k) return [];
+  const [head, ...tail] = arr;
+  return [...subsetsOf(tail, k - 1).map((s) => [head, ...s]), ...subsetsOf(tail, k)];
+}
+
+/**
+ * The exact posterior probability that the provider's next call refuses, given the outcomes of its
+ * calls so far. The worlds are the trial's own draw: a budget uniform in the provider's sealed
+ * range, one or two scheduled refusals uniform over the call numbers in [2, budget-1] (schedules
+ * holding call 2 weighted by SECOND_CALL_WEIGHT for the designated provider), and with probability
+ * one in ten an outage from a uniform call number in the same range. A world survives when the
+ * refusals it predicts reproduce the outcomes seen, call for call; the risk is the surviving
+ * weight of the worlds that refuse the next call. A provider never called has risk 0: no world
+ * refuses a first call. Providers missing from the range table get the widest support.
+ */
+function posteriorRisk(providerId: string, seen: readonly boolean[]): number {
+  const [lo, hi] = BUDGET_RANGE[providerId] ?? [4, 16];
+  const n = seen.length;
+  let refuseWeight = 0;
+  let totalWeight = 0;
+  for (let budget = lo; budget <= hi; budget++) {
+    const slots: number[] = [];
+    for (let i = 2; i <= budget - 1; i++) slots.push(i);
+    const schedules: number[][] = [];
+    for (const count of [1, 2]) for (const s of subsetsOf(slots, Math.min(count, slots.length))) schedules.push(s);
+    const outages: (number | null)[] = [null];
+    for (let i = 2; i <= budget - 1; i++) outages.push(i);
+    for (const schedule of schedules) {
+      const scheduleWeight =
+        ((schedule.includes(2) ? SECOND_CALL_WEIGHT : 1) * 0.5) /
+        Math.max(1, schedule.length === 1 ? slots.length : (slots.length * (slots.length - 1)) / 2);
+      for (const outage of outages) {
+        const weight = (scheduleWeight * (outage === null ? 0.9 : 0.1 / Math.max(1, slots.length))) / (hi - lo + 1);
+        let consistent = true;
+        for (let i = 1; i <= n; i++) {
+          const refused = i > budget || (outage !== null && i >= outage) || schedule.includes(i);
+          if (refused !== seen[i - 1]) {
+            consistent = false;
+            break;
+          }
+        }
+        if (!consistent) continue;
+        totalWeight += weight;
+        const next = n + 1;
+        if (next > budget || (outage !== null && next >= outage) || schedule.includes(next)) refuseWeight += weight;
+      }
+    }
+  }
+  return totalWeight === 0 ? 1 : refuseWeight / totalWeight;
+}
+
+/** The provider's posterior refusal risk for its next call, cached by its outcome pattern. */
+function riskOf(providerId: string): number {
+  const seen = outcomes.get(providerId) ?? [];
+  const key = `${providerId}|${seen.map((r) => (r ? 'R' : '.')).join('')}`;
+  const cached = riskCache.get(key);
+  if (cached !== undefined) return cached;
+  const risk = posteriorRisk(providerId, seen);
+  riskCache.set(key, risk);
+  return risk;
+}
+
+/** Record one call's outcome: the state the posterior and the refusal counts are functions of. */
+function recordOutcome(providerId: string, refused: boolean): void {
+  const seen = outcomes.get(providerId);
+  if (seen === undefined) outcomes.set(providerId, [refused]);
+  else seen.push(refused);
+}
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -169,31 +285,56 @@ function clientJsonMode(clientApi: 'openai' | 'anthropic', body: Json): boolean 
  */
 function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic', body: Json): Candidate[] {
   const jsonMode = clientJsonMode(clientApi, body);
-  const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    if ((refusals.get(probe.provider.id) ?? 0) >= DEAD_AFTER_REFUSALS) continue;
-    const cap = ATTEMPT_CAP[probe.provider.id];
-    if (cap !== undefined && (attempts.get(probe.provider.id) ?? 0) >= cap) continue;
-    if (jsonMode && probe.provider.wire === 'anthropic') continue;
-    for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
-    }
-  }
   const preference = (id: string): number => {
     const at = PROVIDER_PREFERENCE.indexOf(id);
     return at === -1 ? PROVIDER_PREFERENCE.length : at;
   };
-  out.sort(
-    (a, b) =>
-      b.rating - a.rating ||
-      preference(a.probe.provider.id) - preference(b.probe.provider.id) ||
-      (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
-  );
-  return out;
+  const build = (excludeRisky: boolean): Candidate[] => {
+    const out: Candidate[] = [];
+    for (const probe of probes) {
+      if (!probe.ok) continue;
+      if ((refusals.get(probe.provider.id) ?? 0) >= DEAD_AFTER_REFUSALS) continue;
+      const cap = ATTEMPT_CAP[probe.provider.id];
+      if (cap !== undefined && (attempts.get(probe.provider.id) ?? 0) >= cap) continue;
+      // A provider whose next call is more likely than not to refuse on the posterior sits this
+      // request out: the call it would burn buys a likelier answer one step down the list.
+      if (excludeRisky && (attempts.get(probe.provider.id) ?? 0) > 0 && riskOf(probe.provider.id) >= RISK_EXCLUDE) continue;
+      if (jsonMode && probe.provider.wire === 'anthropic') continue;
+      for (const model of probe.models) {
+        const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+        if (!modelFree(model, row)) continue;
+        if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+        out.push({ probe, model, rating: row?.rating_milli ?? 0 });
+      }
+    }
+    out.sort(
+      (a, b) =>
+        b.rating - a.rating ||
+        preference(a.probe.provider.id) - preference(b.probe.provider.id) ||
+        (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+    );
+    // Between near-equals the safer provider walks first: bubble a candidate down past a
+    // near-equal whose next call is safer by more than DEMOTE_RHO, until the order is stable.
+    // Ratings more than DEMOTE_DELTA apart never trade places, so the walk's quality is v1's.
+    let moved = true;
+    while (moved) {
+      moved = false;
+      for (let i = 0; i + 1 < out.length; i++) {
+        const a = out[i];
+        const b = out[i + 1];
+        if (a.probe.provider.id === b.probe.provider.id) continue;
+        if (a.rating - b.rating <= DEMOTE_DELTA && riskOf(a.probe.provider.id) - riskOf(b.probe.provider.id) > DEMOTE_RHO) {
+          out[i] = b;
+          out[i + 1] = a;
+          moved = true;
+        }
+      }
+    }
+    return out;
+  };
+  const ranked = build(true);
+  // The risk filter may never empty the list: if it would, the request walks the unfiltered list.
+  return ranked.length > 0 ? ranked : build(false);
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -340,11 +481,13 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
       });
     } catch (err) {
       refusals.set(provider.id, (refusals.get(provider.id) ?? 0) + 1);
+      recordOutcome(provider.id, true);
       lastError = (err as Error).message;
       continue;
     }
     if (!upstream.ok) {
       refusals.set(provider.id, (refusals.get(provider.id) ?? 0) + 1);
+      recordOutcome(provider.id, true);
       lastError = `${provider.id} answered HTTP ${upstream.status}`;
       try {
         await upstream.body?.cancel();
@@ -353,6 +496,7 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
       }
       continue;
     }
+    recordOutcome(provider.id, false);
     // The one successful call: answer in the client's wire.
     if (stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
